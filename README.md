@@ -7,7 +7,7 @@ assets. It loads the game's own native libraries (`libwalaber.so`,
  
 ## Install & run
  
-You need files from `com.disney.wheresmywater2_goo`.
+You need files from `com.disney.wheresmywater2_goo` version 1.9.49.
  
 Copy the `.nro` to your SD card (e.g. `sdmc:/switch/wmw2_nx/wmw2_nx.nro`), then
 place your game files next to the `.nro`, in the same folder:
