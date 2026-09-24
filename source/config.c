@@ -19,13 +19,13 @@
 
 // The landscape swapchain / touch panel space. Locked in both handheld and
 // docked so the presentation never changes underneath the engine.
-int screen_width  = 1280;
-int screen_height = 720;
+int screen_width  = 1920;
+int screen_height = 1080;
 
 // The portrait space the engine is told it has. Rotated 90 degrees this lands
 // exactly on the panel above, 1:1.
-int render_width  = 720;
-int render_height = 1280;
+int render_width  = 1080;
+int render_height = 1920;
 
 // ---------------------------------------------------------------------------
 // locale
@@ -81,7 +81,10 @@ const char *wmw_country_code(void)  { resolve_locale(); return s_country; }
 // config.txt
 // ---------------------------------------------------------------------------
 //
-// Optional, sits next to the .nro. Currently one key:
+// Optional, sits next to the .nro. Two keys:
+//
+//     pillarbox = 0     (default) rotated, fills the screen -- see `rotation`
+//     pillarbox = 1               upright, pillarboxed -- `rotation` is ignored
 //
 //     rotation = 1     (default) 90 CW  -- right Joy-Con up
 //     rotation = 2               90 CCW -- left Joy-Con up
@@ -89,8 +92,8 @@ const char *wmw_country_code(void)  { resolve_locale(); return s_country; }
 // Which way feels right depends on how you like to hold the console; there is
 // no correct answer, so it is a setting rather than a guess.
 
-static int s_rotation = -1;
-
+static int s_rotation  = -1;
+static int s_pillarbox = -1;
 
 static void trim(char *s) {
   char *p = s;
@@ -105,7 +108,21 @@ static const char *const k_default_config =
   "#\n"
   "# This file was written automatically on first launch. Edit it and relaunch.\n"
   "\n"
-  "# rotation -- which way the portrait image is turned onto the panel.\n"
+  "# pillarbox -- show the portrait image upright, centred on the landscape\n"
+  "# panel with bars either side, instead of rotating it to fill the screen.\n"
+  "# For playing with the console held normally rather than turned on its side.\n"
+  "# When enabled, `rotation` below is ignored.\n"
+  "#\n"
+  "#   0   rotated, fills the screen   (default)\n"
+  "#   1   upright, pillarboxed\n"
+  "#\n"
+  "# Holding LS (left stick click) for 2 seconds in-game flips between the two\n"
+  "# without restarting. That is not saved -- this file sets how the game starts.\n"
+  "\n"
+  "pillarbox = 0\n"
+  "\n"
+  "# rotation -- which way the portrait image is turned onto the panel. Only\n"
+  "# used when pillarbox = 0.\n"
   "#\n"
   "# The game is portrait, so you hold the console sideways like a phone. Which\n"
   "# way you turn it is a matter of preference and of which Joy-Con you want\n"
@@ -115,7 +132,7 @@ static const char *const k_default_config =
   "#   2   90 degrees counter-clockwise -- LEFT Joy-Con up\n"
   "#\n"
   "# Touch, the on-screen cursor, the stick, a USB mouse and gyro pointing all\n"
-  "# follow this setting together, so they cannot disagree with the picture.\n"
+  "# follow both settings together, so they cannot disagree with the picture.\n"
   "\n"
   "rotation = 1\n";
 
@@ -127,11 +144,15 @@ static void write_default_config(const char *path) {
   debugPrintf("config: wrote a default %s\n", path);
 }
 
-int wmw_rotation_mode(void) {
+// Reads config.txt once and resolves both settings together, so a caller can
+// never observe `rotation` from before `pillarbox` was parsed or vice versa.
+// s_rotation doubles as the "already parsed" flag for both.
+static void parse_config(void) {
   if (s_rotation >= 0)
-    return s_rotation;
+    return;
 
-  s_rotation = WMW_TATE_CW; // default: rotated, fullscreen
+  s_rotation  = WMW_TATE_CW; // default: rotated, fullscreen
+  s_pillarbox = 0;           // default: not pillarboxed
 
   char path[512];
   snprintf(path, sizeof(path), "%s/config.txt", wmw_game_dir());
@@ -139,8 +160,8 @@ int wmw_rotation_mode(void) {
   if (!f) {
     // Write a documented one so the setting is discoverable without the README.
     write_default_config(path);
-    debugPrintf("config: rotation = 1 (90 CW, right Joy-Con up) [default]\n");
-    return s_rotation;
+    debugPrintf("config: pillarbox = 0, rotation = 1 (90 CW, right Joy-Con up) [default]\n");
+    return;
   }
 
   char line[256];
@@ -154,6 +175,14 @@ int wmw_rotation_mode(void) {
     trim(key); trim(val);
     /* Unknown keys are skipped, so a migs_profile line left over from an
      * earlier build is ignored rather than overriding anything. */
+
+    if (strcmp(key, "pillarbox") == 0) {
+      s_pillarbox = (val[0] == '1') ? 1 : 0;
+      debugPrintf("config: pillarbox = %d (%s)\n", s_pillarbox,
+                  s_pillarbox ? "upright, pillarboxed" : "rotated, fullscreen");
+      continue;
+    }
+
     if (strcmp(key, "rotation") != 0) continue;
 
     // Numeric, and deliberately the same values as the WMW_TATE_* enum and as
@@ -161,10 +190,9 @@ int wmw_rotation_mode(void) {
     // transform are all literally the same number and cannot be mismatched in
     // translation.
     //
-    // Only 1 and 2 are offered. The game is portrait and the point of the port
-    // is to play it that way; an unrotated pillarboxed mode wastes most of the
-    // panel. Anything else, including the old cw/ccw spellings and any stray
-    // value, resolves to 1.
+    // Only 1 and 2 are offered here (0/WMW_TATE_UPRIGHT is reached through
+    // `pillarbox` instead, not as a rotation value). Anything else, including
+    // the old cw/ccw spellings and any stray value, resolves to 1.
     s_rotation = (val[0] == '2' || !strcasecmp(val, "ccw")) ? WMW_TATE_CCW
                                                            : WMW_TATE_CW;
 
@@ -173,5 +201,18 @@ int wmw_rotation_mode(void) {
                                            : "90 CW, right Joy-Con up");
   }
   fclose(f);
-  return s_rotation;
+}
+
+int wmw_rotation_mode(void)      { parse_config(); return s_rotation; }
+int wmw_pillarbox_enabled(void)  { parse_config(); return s_pillarbox; }
+
+int wmw_tate_mode(void) {
+  parse_config();
+  return s_pillarbox ? WMW_TATE_UPRIGHT : s_rotation;
+}
+
+void wmw_set_pillarbox_enabled(int enabled) {
+  parse_config();          // don't let a live toggle race the initial file read
+  s_pillarbox = enabled ? 1 : 0;
+  debugPrintf("config: pillarbox = %d (live toggle)\n", s_pillarbox);
 }

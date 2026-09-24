@@ -51,6 +51,7 @@
 #include "imports.h"
 #include "jni_fake.h"
 #include "fmod_audio.h"
+#include "wmw2_fmod.h"
 
 #include "wmw2_entrypoints.h"
 #include "wmw2_bridges.h"
@@ -287,14 +288,21 @@ static void ensure_databases(void) {
 }
 
 static void set_screen_size(void) {
-  /* Locked to the handheld panel in both modes. The portrait target is rotated
-   * onto it 1:1, so docking changes nothing: the engine is never told its
-   * resolution moved, and there is no re-layout to go wrong halfway through a
-   * level. Docked simply shows the same rotated image, upscaled by the console. */
-  screen_width  = 1280;
-  screen_height = 720;
-  render_width  = 720;
-  render_height = 1280;
+  /* Locked to the same size in both modes, so docking changes nothing: the
+   * engine is never told its resolution moved, and there is no re-layout to go
+   * wrong halfway through a level.
+   *
+   * 1080p rather than the handheld panel's native 720p: the OS downscales for
+   * free when handheld (a supersampled, slightly antialiased image on the
+   * 1280x720 panel) and presents 1:1, unscaled, when docked.
+   * WMW2_PANEL_WIDTH_MM / HEIGHT_MM in config.h are scaled right alongside
+   * render_width/height so the pixels-per-millimetre the engine derives is
+   * unchanged from the 720p numbers -- change one and you must change the other.
+   * The touchscreen does NOT follow this; see WMW2_TOUCH_PANEL_W/H. */
+  screen_width  = 1920;
+  screen_height = 1080;
+  render_width  = 1080;
+  render_height = 1920;
   debugPrintf("screen: window %dx%d, engine renders %dx%d (portrait)\n",
               screen_width, screen_height, render_width, render_height);
 }
@@ -525,6 +533,9 @@ static void resolve_entry_points(void) {
       "Java_org_fmod_FMODAudioDevice_fmodGetInfo");
   fmod_process_addr = so_try_find_addr_rx(&fmod_mod,
       "Java_org_fmod_FMODAudioDevice_fmodProcess");
+  /* Same constraint as the two above: capture it before so_finalize(). The
+   * engine's import of this symbol is bound to wmw2_fmod.c, which forwards here. */
+  wmw2_fmod_bind(so_try_find_addr_rx(&fmod_mod, "_ZN4FMOD6System16setDSPBufferSizeEji"));
 
   if (!wmw2.chassis_Startup || !wmw2.render_Init || !wmw2.render_DrawFrame)
     fatal_error("libwalaber.so is missing its Chassis\nor Rendering entry points.\n"
@@ -670,11 +681,15 @@ static void input_init(void) {
   pcfg.screen_h = render_height;
 
   /* The touch panel is bonded to the physical glass and does not rotate just
-   * because the image does, so it stays in landscape panel space. */
-  pcfg.panel_w  = screen_width;
-  pcfg.panel_h  = screen_height;
+   * because the image does, so it stays in landscape panel space -- the
+   * digitizer's own FIXED native resolution, not screen_width/screen_height
+   * (our chosen swapchain size, which is a display-only concept the touch
+   * hardware has never heard of). The two only coincided while the swapchain
+   * was 1280x720. See WMW2_TOUCH_PANEL_W/H in config.h. */
+  pcfg.panel_w  = WMW2_TOUCH_PANEL_W;
+  pcfg.panel_h  = WMW2_TOUCH_PANEL_H;
 
-  pcfg.rotation     = wmw_rotation_mode();
+  pcfg.rotation     = wmw_tate_mode();
   pcfg.handle_touch = 1;   /* one owner for the input rotation, not two */
   pcfg.data_dir     = wmw_game_dir();
   pcfg.log          = nxp_log;
@@ -777,8 +792,32 @@ static void dispatch_phase(int phase, const NxpEvent *ev, int n) {
     wmw2.touch_Moved(fake_env, touch, count, a_x, a_y, a_px, a_py, a_id);
 }
 
+/* Holding LS for 2s (see nx_pointer's gesture) flips between the rotated
+ * fullscreen presentation and the pillarboxed upright one, live. Runs here --
+ * the top of feed_pointer(), called once per frame before wmw_tate_begin()
+ * rebinds for the frame -- so the FBO rebuild inside wmw_tate_init() never
+ * leaves a frame rendering into a target that was just torn down.
+ *
+ * Cutscenes cannot be caught mid-toggle: wmw2_movie.c runs its own blocking
+ * loop with its own padUpdate(), so this is not reached while a clip plays.
+ * The render size never changes on a toggle -- only how the portrait target is
+ * put on the panel -- so the engine and the movie player are not told anything. */
+static void handle_mode_toggle(void) {
+  if (!nxp_toggle_requested()) return;
+
+  wmw_set_pillarbox_enabled(!wmw_pillarbox_enabled());
+  const int mode = wmw_tate_mode();
+  debugPrintf("main: mode toggle -- now %s\n",
+              mode == WMW_TATE_UPRIGHT ? "upright (pillarboxed)" : "rotated (fullscreen)");
+
+  if (!wmw_tate_init(render_width, render_height, screen_width, screen_height, mode))
+    debugPrintf("tate: re-init failed on live toggle -- portrait presentation disabled\n");
+  nxp_set_rotation(mode);
+}
+
 static void feed_pointer(void) {
   nxp_update();
+  handle_mode_toggle();
   NxpEvent ev[16];
   const int n = nxp_poll(ev, 16);
   if (!n) return;
@@ -826,7 +865,7 @@ static void applet_hook_fn(AppletHookType type, void *param) {
     }
 
     case AppletHookType_OnOperationMode:
-      /* The presentation is locked to 1280x720 in both modes, so the engine is
+      /* The presentation is locked to 1920x1080 in both modes, so the engine is
        * deliberately NOT told anything changed -- there is no re-layout to go
        * wrong mid-level. Only the window needs resizing. */
       set_screen_size();
@@ -880,7 +919,7 @@ int main(void) {
   /* Portrait presentation. Must come after egl_init() (it needs a current
    * context) and before the engine is told its size. */
   if (!wmw_tate_init(render_width, render_height,
-                     screen_width, screen_height, wmw_rotation_mode()))
+                     screen_width, screen_height, wmw_tate_mode()))
     debugPrintf("tate: portrait unavailable -- rendering landscape as-is\n");
 
   load_two_modules();

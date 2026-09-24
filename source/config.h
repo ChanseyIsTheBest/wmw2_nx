@@ -81,6 +81,25 @@
 /* Per-line SD-card writes are slow; set to 0 for release builds. */
 #define DEBUG_LOG 0
 
+/* SDL audio period, in 48 kHz frames. The Switch SDL backend double-buffers at
+ * this size, so output latency is roughly 1-2x this on top of FMOD's own queue
+ * (see WMW2_FMOD_DSP_BUFFER_LENGTH). 1024 = 21.3 ms per period. 512 is snappier
+ * still; go back up to 2048 only if you hear crackle (with DEBUG_LOG on, the
+ * opensles heartbeat line shows a rising underrun count). Named WMW_ rather
+ * than WMW2_ because opensles.c is shared verbatim with the WMW1 port. */
+#define WMW_AUDIO_SAMPLES 1024
+
+/* FMOD DSP block length, in frames at FMOD's 24 kHz mix rate.
+ *
+ * The engine asks FMOD for 1024 x 4 before init. FMOD's OpenSL output keeps the
+ * newest mixed block (numbuffers - 1) blocks from the play head, so that alone
+ * puts ~128 ms between a sound starting and it being heard. 512 is FMOD's own
+ * default and what WMW1 runs on the identical libfmodex (~64 ms). Measured tap
+ * to audible with the OpenSL shim fix: 1024 -> ~181 ms, 512 -> ~113 ms.
+ *
+ * 0 passes the engine's request through untouched. See wmw2_fmod.c. */
+#define WMW2_FMOD_DSP_BUFFER_LENGTH 512
+
 /* Frame rate the main loop is held to. The panel is 60 Hz and the engine has no
  * internal limiter, so this is what actually paces the game. */
 #define WMW2_TARGET_FPS 60
@@ -89,21 +108,38 @@
  *
  * BridgeRendering.RenderInit() computed these as
  *     (widthPixels / DisplayMetrics.xdpi) * 25.4f
- * so they must describe the display AS THE ENGINE SEES IT, which is portrait --
- * the engine is told 720x1280. The Switch panel is 6.2" 16:9, i.e. 137.2 x 77.2
- * mm held normally, so 77.2 wide by 137.2 tall turned on its side. Both axes
- * then work out to ~237 dpi.
+ * so they must describe the display AS THE ENGINE SEES IT, which is portrait.
+ * The Switch panel is 6.2" 16:9, i.e. 137.2 x 77.2 mm held normally, so 77.2
+ * wide by 137.2 tall turned on its side -- ~237 dpi at the panel's own 720x1280.
+ *
+ * The engine renders at 1080x1920 (see render_* below), so both figures are
+ * scaled by the same 1.5x. That keeps pixels / millimetres -- and therefore
+ * every physical size the engine derives -- exactly where it was at 720p, and
+ * consistent with WMW2_DENSITY_DPI, which the engine is also handed. Scaling
+ * only the pixel size would have told the engine it had a 356 dpi display.
+ * (WMW2 ships a single texture set: none of the 3,509 asset paths in
+ * libwalaber.so carry a resolution-tier suffix, so there is no art tier for a
+ * DPI change to reach for. Keeping the DPI fixed is about layout, not assets.)
  *
  * Pairing landscape millimetres with a portrait pixel size instead gives 133
  * dpi across and 421 dpi down: not a real display, and the engine derives a
  * nonsense scale from it. This was a real WMW1 bug; the arithmetic moved from
  * getDisplayWidthInMM() into an argument, but the trap is identical. */
-#define WMW2_PANEL_WIDTH_MM   77.2f
-#define WMW2_PANEL_HEIGHT_MM 137.2f
+#define WMW2_PANEL_WIDTH_MM  115.8f   /*  77.2 * 1.5 */
+#define WMW2_PANEL_HEIGHT_MM 205.8f   /* 137.2 * 1.5 */
 
 /* jniRenderInit's 5th argument: DisplayMetrics.densityDpi. Keep it consistent
- * with the millimetre figures above -- the engine cross-checks them. */
+ * with the millimetre figures above -- the engine cross-checks them. Unchanged
+ * by the 1080p render size, because the millimetres scaled with it. */
 #define WMW2_DENSITY_DPI 237
+
+/* The touchscreen digitizer's native resolution. A HARDWARE constant: the Switch
+ * reports touches in 1280x720 panel space regardless of what the app renders
+ * at, so this must never follow screen_width/screen_height. It only happened to
+ * equal them while the swapchain was 1280x720; at 1920x1080 using the screen
+ * size here would put every touch in the wrong place. */
+#define WMW2_TOUCH_PANEL_W 1280
+#define WMW2_TOUCH_PANEL_H 720
 
 /* WMW2 is a portrait game, confirmed from the shipped UI layouts:
  * assets/Water/Data/SN_MainMenu.xml declares its screen-base widget as
@@ -112,17 +148,24 @@
  * is rotated 90 degrees onto the landscape panel, so you turn the console on
  * its side and play it like a phone. See wmw_tate.c.
  *
- * Two coordinate spaces, and it matters which is which:
+ * Three coordinate spaces, and it matters which is which:
  *
- *   screen_* -- the real landscape swapchain and the space the touchscreen
- *               reports in. Locked to 1280x720 in BOTH handheld and docked, so
- *               the presentation is identical either way and the engine is
- *               never asked to re-lay-out on a dock/undock.
- *   render_* -- the portrait size the ENGINE believes it has (720x1280),
+ *   screen_* -- the real landscape swapchain. Locked to 1920x1080 in BOTH
+ *               handheld and docked, so the presentation is identical either
+ *               way and the engine is never asked to re-lay-out on a
+ *               dock/undock. Handheld, the OS downscales it to the 720p panel
+ *               (a supersampled image); docked, it is presented 1:1.
+ *   render_* -- the portrait size the ENGINE believes it has (1080x1920),
  *               passed to jniRenderInit and jniRenderAreaResized. Rotated, it
- *               lands 1:1 on the panel: no scaling, no letterboxing.
+ *               lands 1:1 on the swapchain: no scaling, no letterboxing.
+ *   touch    -- WMW2_TOUCH_PANEL_W/H above. Fixed by the hardware, and not the
+ *               same thing as screen_* any more.
  *
- * Note 720x1280 trips neither half of the engine's internal "extreme aspect"
+ * Cost: the engine's own draws, the fluid simulation included, cover 2.25x the
+ * pixels they did at 720p. WMW1 measured 3-6 ms per frame at this size, well
+ * inside the 16.7 ms budget; worth watching the frame log if WMW2 differs.
+ *
+ * Note 1080x1920 trips neither half of the engine's internal "extreme aspect"
  * test in jniRenderInit (2*w <= h or 2*h <= w), so the flag it would otherwise
  * set stays clear. That is what we want: it is a layout fallback for 2:1+
  * phones, not for this. */
@@ -131,9 +174,18 @@ extern int screen_height;
 extern int render_width;
 extern int render_height;
 
-/* Which way to rotate. Overridable at runtime in <gamedir>/config.txt with
- *   rotation = cw | ccw | upright */
-int wmw_rotation_mode(void);
+/* Presentation, from <gamedir>/config.txt (see config.c):
+ *   pillarbox = 0 | 1   upright and pillarboxed instead of rotated
+ *   rotation  = 1 | 2   which way to rotate when not pillarboxed
+ * Holding LS for 2 s flips pillarbox live, in memory only. */
+int  wmw_rotation_mode(void);      /* WMW_TATE_CW or WMW_TATE_CCW */
+int  wmw_pillarbox_enabled(void);
+void wmw_set_pillarbox_enabled(int enabled);
+
+/* The single place pillarbox and rotation are combined into the one mode value
+ * that both wmw_tate_init() and NxpConfig.rotation take, so the picture and the
+ * input mapping can never disagree about which mode is active. */
+int  wmw_tate_mode(void);
 
 /* Language / country reported to the engine through jniWalaberChassisStartup,
  * derived from the Switch system language at boot. */

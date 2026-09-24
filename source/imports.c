@@ -75,6 +75,7 @@
 #include "wmw_shims.h"
 #include "util.h"
 #include "config.h"
+#include "wmw2_fmod.h"
 #include "wmw_tate.h"
 #include "wmw_paths.h"
 #include "error.h"
@@ -990,6 +991,12 @@ DynLibFunction dynlib_functions[] = {
    * rather than returning a bad time. The shim has existed in libc_shim.c the
    * whole time; the table simply never pointed at it. */
   { "clock_gettime", (uintptr_t)&clock_gettime_fake },
+
+  /* The one FMOD entry point that is interposed rather than bound straight to
+   * libfmodex: the engine asks for 1024-frame DSP blocks, which doubles FMOD's
+   * output latency over WMW1. See wmw2_fmod.c; WMW2_FMOD_DSP_BUFFER_LENGTH in
+   * config.h turns it off. The real function is bound in resolve_entry_points(). */
+  { "_ZN4FMOD6System16setDSPBufferSizeEji", (uintptr_t)&wmw2_fmod_setDSPBufferSize },
 
 };
 

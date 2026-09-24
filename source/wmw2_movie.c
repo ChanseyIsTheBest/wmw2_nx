@@ -66,7 +66,7 @@
 #define ARING_FRAMES   (MOVIE_RATE * 2)   /* two seconds of slack */
 
 static void (*s_present)(void);
-static int   s_render_w = 720, s_render_h = 1280;
+static int   s_render_w = 1080, s_render_h = 1920;  /* set by wmw2_movie_init() */
 static int   s_inited;
 
 /* --- audio ring, written by the play loop, drained by the FMOD pump -------- */
